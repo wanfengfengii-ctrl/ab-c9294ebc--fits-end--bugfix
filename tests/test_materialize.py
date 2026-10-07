@@ -1,5 +1,6 @@
 """Unit tests for checksum materialization (fitsaudit.core)."""
 
+import os
 import struct
 import unittest
 
@@ -21,11 +22,31 @@ from fitsaudit.fixtures import (
     image_hdu,
     primary_hdu,
 )
+from verify import stdfits
+
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 
 def _verdicts(report):
     return [(h["datasum"]["verdict"], h["checksum"]["verdict"])
             for h in report["hdus"]]
+
+
+def _assert_std_reader_accepts(testcase, blob, hdu_count=None):
+    """Strict END-stopping reader sees valid checksum cards before END."""
+    ok, hdus = stdfits.verify_materialized(blob)
+    testcase.assertTrue(ok, hdus)
+    if hdu_count is not None:
+        testcase.assertEqual(len(hdus), hdu_count)
+    for hdu in hdus:
+        testcase.assertTrue(hdu["datasum"]["present"])
+        testcase.assertTrue(hdu["datasum"]["valid"])
+        testcase.assertTrue(hdu["datasum"]["card_before_end"])
+        testcase.assertTrue(hdu["checksum"]["present"])
+        testcase.assertTrue(hdu["checksum"]["valid"])
+        testcase.assertTrue(hdu["checksum"]["card_before_end"])
+    return hdus
 
 
 class MaterializeSuccessTests(unittest.TestCase):
@@ -56,21 +77,47 @@ class MaterializeSuccessTests(unittest.TestCase):
     def test_scientific_payload_byte_identical(self):
         early = fixtures.build_valid_file(2, checksums=False)
         completed = materialize_checksums(early)
-        for h in audit_bytes(early)["hdus"]:
+        before = audit_bytes(early)
+        for h in before["hdus"]:
             start = h["data"]["offset"]
             end = start + h["data"]["paddedBytes"]
             self.assertEqual(completed[start:end], early[start:end])
-        # Only header padding (spaces in the input) differs.
+        # The only input bytes allowed to change are blank (space)
+        # padding slots -- overwritten by a new card or by the shifted
+        # END card -- and the old END card slots, which the inserted
+        # cards overwrite (the END card itself moves to a former blank
+        # slot).  Nothing else in the header may move or change.
+        end_card_spans = []
+        for h in before["hdus"]:
+            # END is the last content card: one card before content end.
+            content_bytes = (h["header"]["offset"]
+                             + (h["header"]["cards"] - 1) * 80)
+            end_card_spans.append((content_bytes, content_bytes + 80))
+
+        def in_old_end_card(i):
+            return any(lo <= i < hi for lo, hi in end_card_spans)
+
         for i, (a, b) in enumerate(zip(early, completed)):
             if a != b:
-                self.assertEqual(a, 0x20, i)
+                self.assertTrue(
+                    a == 0x20 or in_old_end_card(i),
+                    "byte %d outside a blank slot/old END card changed: "
+                    "0x%02X -> 0x%02X" % (i, a, b))
 
-    def test_cards_land_directly_after_end(self):
-        completed = materialize_checksums(primary_hdu(checksums=False))
-        end_off = fixtures.find_card(completed, "END")
-        self.assertEqual(completed[end_off + 80:end_off + 88], b"DATASUM ")
-        self.assertEqual(completed[end_off + 160:end_off + 168],
-                         b"CHECKSUM")
+    def test_cards_land_directly_before_end(self):
+        early = primary_hdu(checksums=False)
+        old_end = fixtures.find_card(early, "END")
+        completed = materialize_checksums(early)
+        # Two cards inserted: the END card shifts exactly two slots
+        # later, with DATASUM then CHECKSUM directly in front of it.
+        new_end = old_end + 160
+        self.assertEqual(completed[new_end:new_end + 80],
+                         fixtures.END_CARD)
+        self.assertEqual(completed[new_end - 160:new_end - 152],
+                         b"DATASUM ")
+        self.assertEqual(completed[new_end - 80:new_end - 72], b"CHECKSUM")
+        # Everything after the (shifted) END stays pure space padding.
+        self.assertEqual(completed[new_end + 80:2880], b" " * (2880 - new_end - 80))
 
     def test_datasum_value_matches_data(self):
         data = struct.pack(">12h", *range(-6, 6))
@@ -90,16 +137,22 @@ class MaterializeSuccessTests(unittest.TestCase):
         self.assertEqual(len(completed), len(early))
         self.assertEqual(audit_bytes(completed)["conclusion"], ACCEPTED)
 
-    def test_multiblock_header_uses_slots_after_end(self):
+    def test_multiblock_header_uses_slots_before_end(self):
         cards = [card("SIMPLE", True), card("BITPIX", 8), card("NAXIS", 0)]
         cards += [card("COMMENT", None) for _ in range(40)]  # 2 header blocks
         early = header_block(cards)
         self.assertEqual(len(early), 5760)
+        old_end = fixtures.find_card(early, "END")
         completed = materialize_checksums(early)
-        end_off = fixtures.find_card(completed, "END")
-        self.assertEqual(completed[end_off + 80:end_off + 88], b"DATASUM ")
-        self.assertEqual(completed[end_off + 160:end_off + 168],
-                         b"CHECKSUM")
+        # END shifts by two slots but the header block count (and so the
+        # data offset and file length) is unchanged.
+        new_end = fixtures.find_card(completed, "END")
+        self.assertEqual(new_end, old_end + 160)
+        self.assertEqual(completed[new_end - 160:new_end - 152],
+                         b"DATASUM ")
+        self.assertEqual(completed[new_end - 80:new_end - 72], b"CHECKSUM")
+        self.assertEqual(completed[new_end + 80:5760],
+                         b" " * (5760 - new_end - 80))
         self.assertEqual(len(completed), len(early))
         self.assertEqual(audit_bytes(completed)["conclusion"], ACCEPTED)
 
@@ -129,9 +182,13 @@ class MaterializeSuccessTests(unittest.TestCase):
         old_off = fixtures.find_card(early, "DATASUM", occurrence=1)
         self.assertEqual(completed[old_off:old_off + 80],
                          early[old_off:old_off + 80])
-        # The new CHECKSUM sits right after END.
+        # The new CHECKSUM sits directly before the shifted END, i.e. in
+        # the old END card's slot.
+        old_end = fixtures.find_card(early, "END", occurrence=1)
         end_off = fixtures.find_card(completed, "END", occurrence=1)
-        self.assertEqual(completed[end_off + 80:end_off + 88], b"CHECKSUM")
+        self.assertEqual(end_off, old_end + 80)
+        self.assertEqual(completed[end_off - 80:end_off - 72], b"CHECKSUM")
+        self.assertEqual(completed[end_off + 80:end_off + 88], b"        ")
         self.assertEqual(audit_bytes(completed)["conclusion"], ACCEPTED)
 
     def test_checksum_only_extension_recomputed_in_place(self):
@@ -154,9 +211,11 @@ class MaterializeSuccessTests(unittest.TestCase):
         self.assertEqual(old_off, new_off)
         self.assertNotEqual(completed[old_off + 11:old_off + 27],
                             early[old_off + 11:old_off + 27])
-        # DATASUM fills the slot after END.
+        # DATASUM fills the old END slot; END shifts by exactly one slot.
+        old_end = fixtures.find_card(early, "END", occurrence=1)
         end_off = fixtures.find_card(completed, "END", occurrence=1)
-        self.assertEqual(completed[end_off + 80:end_off + 88], b"DATASUM ")
+        self.assertEqual(end_off, old_end + 80)
+        self.assertEqual(completed[end_off - 80:end_off - 72], b"DATASUM ")
         self.assertEqual(audit_bytes(completed)["conclusion"], ACCEPTED)
 
 
@@ -296,13 +355,178 @@ class AuditRejectionTests(unittest.TestCase):
         early[480:560] = b"DATASUM  not a value card".ljust(80)
         self._assert_blocked(bytes(early), "NONSPACE_HEADER_PADDING")
 
-    def test_well_formed_padding_checksum_card_is_verified(self):
-        # A correctly shaped DATASUM card placed after END is a real
-        # card and a wrong value rejects via DATASUM_MISMATCH.
+    def test_well_formed_checksum_card_after_end_is_padding(self):
+        # Standard termination: even a correctly shaped DATASUM card
+        # placed after the END card is not a card at all; it is
+        # non-space header padding and rejects like any other padding
+        # byte.  This guarantees the audit verdict matches a standard
+        # reader that stops at the first END card.
         cards = [card("SIMPLE", True), card("BITPIX", 8), card("NAXIS", 0)]
         early = bytearray(header_block(cards))
         early[480:560] = card("DATASUM", 12345)
-        self._assert_blocked(bytes(early), "DATASUM_MISMATCH")
+        self._assert_blocked(bytes(early), "NONSPACE_HEADER_PADDING")
+
+    def test_checksum_card_after_end_never_validates(self):
+        # A complete DATASUM/CHECKSUM pair written after END (the old,
+        # non-interoperable materialization output) must audit the same
+        # way a standard reader sees it: the cards are invisible padding,
+        # and the non-space bytes reject the file outright -- regardless
+        # of whether the embedded values would otherwise be correct.
+        cards = [card("SIMPLE", True), card("BITPIX", 8), card("NAXIS", 0)]
+        early = bytearray(header_block(cards))
+        early[480:560] = card("DATASUM", sum32_be(b""))
+        early[560:640] = card("CHECKSUM", "0" * 16)
+        self._assert_blocked(bytes(early), "NONSPACE_HEADER_PADDING")
+
+
+class StandardReaderInteropTests(unittest.TestCase):
+    """Cross-checks with an independent reader that stops at first END."""
+
+    def test_astropy_reference_is_recognized(self):
+        with open(os.path.join(DATA_DIR, "valid_astropy.fits"), "rb") as fh:
+            blob = fh.read()
+        _assert_std_reader_accepts(self, blob, hdu_count=2)
+
+    def test_both_missing_are_visible_before_end(self):
+        early = fixtures.build_valid_file(2, checksums=False)
+        completed = materialize_checksums(early)
+        hdus = _assert_std_reader_accepts(self, completed, hdu_count=3)
+        # The cards must literally occupy the slots ending at END.
+        for hdu in hdus:
+            end_off = hdu["end_offset"]
+            self.assertEqual(
+                completed[end_off - 160:end_off - 152], b"DATASUM ")
+            self.assertEqual(
+                completed[end_off - 80:end_off - 72], b"CHECKSUM")
+
+    def test_only_checksum_missing(self):
+        data = struct.pack(">6h", *range(6))
+        datasum = sum32_be(data)
+        ext_cards = [card("XTENSION", "IMAGE"), card("BITPIX", 16),
+                     card("NAXIS", 1), card("NAXIS1", 6), card("PCOUNT", 0),
+                     card("GCOUNT", 1), card("DATASUM", datasum)]
+        early = primary_hdu(checksums=True) + header_block(ext_cards) \
+            + data_block(data)
+        completed = materialize_checksums(early)
+        _assert_std_reader_accepts(self, completed, hdu_count=2)
+
+    def test_only_datasum_missing(self):
+        data = struct.pack(">6h", *range(6))
+        datasum = sum32_be(data)
+        ext_cards = [card("XTENSION", "IMAGE"), card("BITPIX", 16),
+                     card("NAXIS", 1), card("NAXIS1", 6), card("PCOUNT", 0),
+                     card("GCOUNT", 1), card("CHECKSUM", "0" * 16)]
+        total = sum32_be(header_block(ext_cards), datasum)
+        ext_cards[-1] = card("CHECKSUM", char_encode(~total & UINT32_MAX))
+        early = primary_hdu(checksums=True) + header_block(ext_cards) \
+            + data_block(data)
+        completed = materialize_checksums(early)
+        _assert_std_reader_accepts(self, completed, hdu_count=2)
+
+    def test_exactly_enough_slots(self):
+        # 33 content cards + END = 34 cards -> exactly 2 blank slots.
+        cards = [card("SIMPLE", True), card("BITPIX", 8), card("NAXIS", 0)]
+        cards += [card("COMMENT", None) for _ in range(30)]
+        early = header_block(cards)
+        completed = materialize_checksums(early)
+        _assert_std_reader_accepts(self, completed, hdu_count=1)
+        # END lands on the final slot of the block.
+        hdus = stdfits.read_hdus(completed)
+        self.assertEqual(hdus[0]["end_offset"], 35 * 80)
+        self.assertEqual(len(completed), 2880)
+
+    def test_exactly_one_slot_for_one_missing_card(self):
+        # One card already present: 34 content cards + END = 35 cards
+        # leave exactly one blank slot, exactly enough for CHECKSUM.
+        cards = [card("SIMPLE", True), card("BITPIX", 8), card("NAXIS", 0),
+                 card("DATASUM", 0)]
+        cards += [card("COMMENT", None) for _ in range(30)]
+        early = header_block(cards)
+        completed = materialize_checksums(early)
+        _assert_std_reader_accepts(self, completed, hdu_count=1)
+        hdus = stdfits.read_hdus(completed)
+        self.assertEqual(hdus[0]["end_offset"], 35 * 80)
+
+    def test_insufficient_space_fails_atomically_in_any_hdu(self):
+        # HDU 0 and HDU 1 have room; HDU 2 has none.  No part of the
+        # request may be materialized.
+        good = primary_hdu(checksums=False)
+        middle = image_hdu(b"\x01\x02", bitpix=8, axes=(2,),
+                           checksums=False)
+        tight_cards = [card("XTENSION", "IMAGE"), card("BITPIX", 8),
+                       card("NAXIS", 0), card("PCOUNT", 0), card("GCOUNT", 1)]
+        tight_cards += [card("COMMENT", None) for _ in range(30)]
+        tight = header_block(tight_cards)
+        early = good + middle + tight
+        with self.assertRaises(MaterializationFailure) as ctx:
+            materialize_checksums(early)
+        self.assertEqual(ctx.exception.report["failure"]["hdu"], 2)
+        self.assertEqual(
+            ctx.exception.report["failure"]["reason"],
+            "INSUFFICIENT_HEADER_SPACE")
+        # Atomicity: materialize_checksums must not return a modified
+        # buffer at all; re-running the audit on the original input shows
+        # every HDU still missing its cards.
+        self.assertEqual(
+            [(h["datasum"]["verdict"], h["checksum"]["verdict"])
+             for h in audit_bytes(early)["hdus"]],
+            [("ABSENT", "ABSENT")] * 3)
+
+    def test_multi_hdu_file_all_cards_before_end(self):
+        early = fixtures.build_valid_file(3, checksums=False)
+        completed = materialize_checksums(early)
+        hdus = _assert_std_reader_accepts(self, completed, hdu_count=4)
+        # Audit verdict and standard-reader verdict agree, HDU by HDU.
+        report = audit_bytes(completed)
+        self.assertEqual(report["conclusion"], ACCEPTED)
+        for report_hdu, std_hdu in zip(report["hdus"], hdus):
+            self.assertEqual(report_hdu["range"]["start"],
+                             std_hdu["header_offset"])
+            self.assertEqual(report_hdu["range"]["end"], std_hdu["padded_end"])
+            self.assertEqual(report_hdu["datasum"]["verdict"], "VALID")
+            self.assertEqual(report_hdu["checksum"]["verdict"], "VALID")
+
+    def test_layout_is_preserved(self):
+        early = fixtures.build_valid_file(2, checksums=False)
+        completed = materialize_checksums(early)
+        self.assertEqual(len(completed), len(early))
+        before = audit_bytes(early)
+        after = audit_bytes(completed)
+        for b, a in zip(before["hdus"], after["hdus"]):
+            self.assertEqual(b["range"], a["range"])
+            self.assertEqual(b["header"]["offset"], a["header"]["offset"])
+            self.assertEqual(b["header"]["bytes"], a["header"]["bytes"])
+            self.assertEqual(b["data"], a["data"])
+        # Standard reader sees the identical layout.
+        std = stdfits.read_hdus(completed)
+        for hdu, report_hdu in zip(std, after["hdus"]):
+            self.assertEqual(hdu["header_bytes"],
+                             report_hdu["header"]["bytes"])
+            self.assertEqual(hdu["data_offset"],
+                             report_hdu["data"]["offset"])
+            self.assertEqual(hdu["padded_end"], report_hdu["range"]["end"])
+
+    def test_science_payload_untouched_multi_hdu(self):
+        early = fixtures.build_valid_file(3, checksums=False)
+        completed = materialize_checksums(early)
+        for hdu in audit_bytes(early)["hdus"]:
+            start = hdu["data"]["offset"]
+            end = start + hdu["data"]["paddedBytes"]
+            self.assertEqual(completed[start:end], early[start:end])
+
+    def test_complete_file_byte_for_byte_identical(self):
+        with open(os.path.join(DATA_DIR, "valid_astropy.fits"), "rb") as fh:
+            blob = fh.read()
+        self.assertEqual(materialize_checksums(blob), blob)
+        self.assertEqual(materialize_checksums(
+            fixtures.build_max_hdus_file()), fixtures.build_max_hdus_file())
+
+    def test_fixed_point(self):
+        early = fixtures.build_valid_file(2, checksums=False)
+        once = materialize_checksums(early)
+        twice = materialize_checksums(once)
+        self.assertEqual(once, twice)
+        _assert_std_reader_accepts(self, once)
 
 
 if __name__ == "__main__":

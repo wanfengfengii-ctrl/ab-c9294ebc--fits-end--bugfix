@@ -7,10 +7,11 @@ Endpoints
 ``POST /api/fits/audit``  audit a FITS file (body is the raw file sent
                           as ``application/fits``, at most 16 MiB)
 ``POST /api/fits/checksums/materialize``
-                          audit first, then fill missing DATASUM /
-                          CHECKSUM cards into blank header slots after
-                          the END card and return the completed file as
-                          ``application/fits``
+                          audit first, then insert missing DATASUM /
+                          CHECKSUM cards before the terminating END card
+                          (the END shifts into existing blank padding
+                          slots within the same header block) and return
+                          the completed file as ``application/fits``
 
 A completed audit always returns HTTP 200; the archival verdict is
 carried by the ``conclusion`` field (``ACCEPTED``/``REJECTED``) of the
