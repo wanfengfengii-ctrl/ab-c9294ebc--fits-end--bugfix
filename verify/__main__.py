@@ -6,7 +6,10 @@ code (bit flags, so failures compose):
 * bit 0 (1): code tests      -- the unit test suite (unittest discover)
 * bit 1 (2): application build -- byte-compilation and import of the app
 * bit 2 (4): HTTP smoke      -- audit verdicts over the live API for a
-  valid file, digest-corrupted files and a truncated file
+  valid file, digest-corrupted files and a truncated file, plus
+  checksum materialization (cards land before the END card where
+  standard readers see them, complete input passes through, failures
+  are atomic)
 
 Exit code 0 means every stage passed.  The service is meant to be run
 once (``docker compose up --exit-code-from verify verify``) and then
@@ -98,6 +101,35 @@ def _decode_json(body):
 def _get(path):
     with urllib.request.urlopen(API_URL + path, timeout=5) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8"))
+
+
+END_IMAGE = b"END".ljust(80, b" ")
+
+
+def _standard_reader_keywords(blob, start):
+    """Read a header the way a standard FITS reader does: 80-byte cards,
+    stopping at the first END card.  Returns the keyword list."""
+    keywords = []
+    pos = start
+    while pos + 80 <= len(blob):
+        keyword = blob[pos:pos + 8].rstrip(b" ").decode("ascii")
+        if keyword == "END":
+            return keywords
+        keywords.append(keyword)
+        pos += 80
+    return keywords
+
+
+def _changed_slots_are_padding_or_end(early, completed):
+    """Every input card slot touched by materialization must be a blank
+    padding slot or the relocated END card (card slots are 80-byte
+    aligned because every HDU boundary is 2880-byte aligned)."""
+    for i, (a, b) in enumerate(zip(early, completed)):
+        if a != b:
+            slot = (i // 80) * 80
+            if early[slot:slot + 80] not in (b" " * 80, END_IMAGE):
+                return False
+    return True
 
 
 def _wait_for_health():
@@ -228,8 +260,8 @@ def run_smoke():
         print("%-28s FAIL (%s)" % ("missing cards materialized",
                                    "; ".join(problems)), flush=True)
     else:
-        # Science sections must be byte-identical; only header padding
-        # (spaces in the input) may have changed.
+        # Science sections must be byte-identical; only blank padding
+        # slots and the relocated END card slots may have changed.
         early_report = audit_bytes(early)
         same_payload = all(
             completed[h["data"]["offset"]
@@ -237,15 +269,25 @@ def run_smoke():
             == early[h["data"]["offset"]
                      :h["data"]["offset"] + h["data"]["paddedBytes"]]
             for h in early_report["hdus"])
-        only_spaces = all(a == 0x20 for a, b in zip(early, completed)
-                          if a != b)
-        ok = same_payload and only_spaces
+        only_padding = _changed_slots_are_padding_or_end(early, completed)
+        ok = same_payload and only_padding
         checks.append(ok)
         print("%-28s %s" % (
             "missing cards materialized",
             "PASS" if ok
-            else "FAIL (payload changed: %s, non-space touched: %s)"
-                 % (same_payload, only_spaces)), flush=True)
+            else "FAIL (payload changed: %s, content slot touched: %s)"
+                 % (same_payload, not only_padding)), flush=True)
+
+    # Standard termination semantics: reading 80-byte cards and stopping
+    # at the first END card must encounter both checksum cards in every
+    # HDU of the materialized file (they sit *before* the END card).
+    before_end = all(
+        {"DATASUM", "CHECKSUM"}
+        <= set(_standard_reader_keywords(completed, h["range"]["start"]))
+        for h in audit_bytes(completed)["hdus"])
+    checks.append(before_end)
+    print("%-28s %s" % ("checksum cards precede END",
+                        "PASS" if before_end else "FAIL"), flush=True)
 
     # Post-completion re-audit: the completed file must earn a full
     # VALID/VALID verdict for every HDU through the audit endpoint.
@@ -270,6 +312,45 @@ def run_smoke():
     print("%-28s %s" % (
         "idempotent retry byte-identical",
         "PASS" if ok else "FAIL (status %d)" % status), flush=True)
+
+    # Only one card missing: an HDU with a valid DATASUM but no CHECKSUM
+    # gets just the CHECKSUM inserted before the END card; the existing
+    # DATASUM card stays byte-for-byte in place.
+    datasum_cards = [fixtures.card("SIMPLE", True),
+                     fixtures.card("BITPIX", 8),
+                     fixtures.card("NAXIS", 0),
+                     fixtures.card("DATASUM", 0)]
+    datasum_only = fixtures.header_block(datasum_cards)
+    status, ctype, filled = _post(materialize_path, datasum_only, raw=True)
+    keywords = (_standard_reader_keywords(filled, 0)
+                if status == 200 else [])
+    ok = (status == 200 and ctype == "application/fits"
+          and len(filled) == len(datasum_only)
+          and filled[3 * 80:4 * 80] == datasum_only[3 * 80:4 * 80]
+          and keywords[-2:] == ["DATASUM", "CHECKSUM"])
+    checks.append(ok)
+    print("%-28s %s" % ("single missing card filled",
+                        "PASS" if ok else "FAIL (status %d)" % status),
+          flush=True)
+
+    # Exactly enough slots: 33 content cards + END leave precisely the
+    # two blank slots the two missing cards need (END takes the last
+    # slot of the block).
+    fit_cards = [fixtures.card("SIMPLE", True), fixtures.card("BITPIX", 8),
+                 fixtures.card("NAXIS", 0)]
+    fit_cards += [fixtures.card("COMMENT", None) for _ in range(30)]
+    exact = fixtures.header_block(fit_cards)
+    status, ctype, done = _post(materialize_path, exact, raw=True)
+    keywords = (_standard_reader_keywords(done, 0)
+                if status == 200 else [])
+    ok = (status == 200 and ctype == "application/fits"
+          and len(done) == len(exact)
+          and done[35 * 80:36 * 80] == END_IMAGE
+          and keywords[-2:] == ["DATASUM", "CHECKSUM"])
+    checks.append(ok)
+    print("%-28s %s" % ("exact slot count fits",
+                        "PASS" if ok else "FAIL (status %d)" % status),
+          flush=True)
 
     # An already complete input is returned byte-for-byte unchanged.
     status, _, passthrough = _post(materialize_path, valid, raw=True)

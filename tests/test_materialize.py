@@ -28,6 +28,23 @@ def _verdicts(report):
             for h in report["hdus"]]
 
 
+END_IMAGE = b"END".ljust(80, b" ")
+
+
+def standard_reader_keywords(blob, start):
+    """Read a header the way a standard FITS reader does: 80-byte cards,
+    stopping at the first END card.  Returns (keywords, end_offset)."""
+    keywords = []
+    pos = start
+    while pos + 80 <= len(blob):
+        keyword = blob[pos:pos + 8].rstrip(b" ").decode("ascii")
+        if keyword == "END":
+            return keywords, pos
+        keywords.append(keyword)
+        pos += 80
+    raise AssertionError("no END card found")  # pragma: no cover
+
+
 class MaterializeSuccessTests(unittest.TestCase):
     def test_missing_cards_are_filled(self):
         early = fixtures.build_valid_file(2, checksums=False)
@@ -60,17 +77,41 @@ class MaterializeSuccessTests(unittest.TestCase):
             start = h["data"]["offset"]
             end = start + h["data"]["paddedBytes"]
             self.assertEqual(completed[start:end], early[start:end])
-        # Only header padding (spaces in the input) differs.
+        # Only blank padding slots and the relocated END card slots of
+        # the input may differ (card slots are 80-byte aligned because
+        # every HDU boundary is 2880-byte aligned).
         for i, (a, b) in enumerate(zip(early, completed)):
             if a != b:
-                self.assertEqual(a, 0x20, i)
+                slot = (i // 80) * 80
+                self.assertIn(early[slot:slot + 80],
+                              (b" " * 80, END_IMAGE),
+                              "byte %d of a content card changed" % i)
 
-    def test_cards_land_directly_after_end(self):
-        completed = materialize_checksums(primary_hdu(checksums=False))
-        end_off = fixtures.find_card(completed, "END")
-        self.assertEqual(completed[end_off + 80:end_off + 88], b"DATASUM ")
-        self.assertEqual(completed[end_off + 160:end_off + 168],
-                         b"CHECKSUM")
+    def test_cards_land_directly_before_end(self):
+        early = primary_hdu(checksums=False)
+        old_end = fixtures.find_card(early, "END")
+        completed = materialize_checksums(early)
+        # The new cards take over the END card's slot and the next blank
+        # slot; the END card is rewritten behind them.
+        self.assertEqual(completed[old_end:old_end + 8], b"DATASUM ")
+        self.assertEqual(completed[old_end + 80:old_end + 88], b"CHECKSUM")
+        self.assertEqual(completed[old_end + 160:old_end + 240], END_IMAGE)
+        # A standard reader (stop at the first END) sees both cards.
+        keywords, end_off = standard_reader_keywords(completed, 0)
+        self.assertEqual(end_off, old_end + 160)
+        self.assertEqual(keywords[-2:], ["DATASUM", "CHECKSUM"])
+
+    def test_every_checksum_card_precedes_end(self):
+        # Multi-HDU file: in every materialized HDU both checksum cards
+        # must sit before the terminating END card, visible to a reader
+        # with standard termination semantics.
+        early = fixtures.build_valid_file(2, checksums=False)
+        completed = materialize_checksums(early)
+        for h in audit_bytes(completed)["hdus"]:
+            keywords, _ = standard_reader_keywords(
+                completed, h["range"]["start"])
+            self.assertIn("DATASUM", keywords)
+            self.assertIn("CHECKSUM", keywords)
 
     def test_datasum_value_matches_data(self):
         data = struct.pack(">12h", *range(-6, 6))
@@ -88,18 +129,22 @@ class MaterializeSuccessTests(unittest.TestCase):
         early = header_block(cards)
         completed = materialize_checksums(early)
         self.assertEqual(len(completed), len(early))
+        # DATASUM/CHECKSUM take slots 33/34; END moves to the last slot.
+        self.assertEqual(completed[33 * 80:33 * 80 + 8], b"DATASUM ")
+        self.assertEqual(completed[34 * 80:34 * 80 + 8], b"CHECKSUM")
+        self.assertEqual(completed[35 * 80:36 * 80], END_IMAGE)
         self.assertEqual(audit_bytes(completed)["conclusion"], ACCEPTED)
 
-    def test_multiblock_header_uses_slots_after_end(self):
+    def test_multiblock_header_inserts_before_end(self):
         cards = [card("SIMPLE", True), card("BITPIX", 8), card("NAXIS", 0)]
         cards += [card("COMMENT", None) for _ in range(40)]  # 2 header blocks
         early = header_block(cards)
         self.assertEqual(len(early), 5760)
+        old_end = fixtures.find_card(early, "END")
         completed = materialize_checksums(early)
-        end_off = fixtures.find_card(completed, "END")
-        self.assertEqual(completed[end_off + 80:end_off + 88], b"DATASUM ")
-        self.assertEqual(completed[end_off + 160:end_off + 168],
-                         b"CHECKSUM")
+        self.assertEqual(completed[old_end:old_end + 8], b"DATASUM ")
+        self.assertEqual(completed[old_end + 80:old_end + 88], b"CHECKSUM")
+        self.assertEqual(completed[old_end + 160:old_end + 240], END_IMAGE)
         self.assertEqual(len(completed), len(early))
         self.assertEqual(audit_bytes(completed)["conclusion"], ACCEPTED)
 
@@ -124,14 +169,16 @@ class MaterializeSuccessTests(unittest.TestCase):
         early = primary_hdu(checksums=True) + header_block(cards) \
             + data_block(data)
         self.assertEqual(audit_bytes(early)["conclusion"], ACCEPTED)
+        old_end = fixtures.find_card(early, "END", occurrence=1)
         completed = materialize_checksums(early)
         # Existing DATASUM card is preserved in place.
         old_off = fixtures.find_card(early, "DATASUM", occurrence=1)
         self.assertEqual(completed[old_off:old_off + 80],
                          early[old_off:old_off + 80])
-        # The new CHECKSUM sits right after END.
-        end_off = fixtures.find_card(completed, "END", occurrence=1)
-        self.assertEqual(completed[end_off + 80:end_off + 88], b"CHECKSUM")
+        # The new CHECKSUM takes the END card's old slot; END moves one
+        # slot deeper into the padding.
+        self.assertEqual(completed[old_end:old_end + 8], b"CHECKSUM")
+        self.assertEqual(completed[old_end + 80:old_end + 160], END_IMAGE)
         self.assertEqual(audit_bytes(completed)["conclusion"], ACCEPTED)
 
     def test_checksum_only_extension_recomputed_in_place(self):
@@ -147,6 +194,7 @@ class MaterializeSuccessTests(unittest.TestCase):
             + data_block(data)
         self.assertEqual(audit_bytes(early)["conclusion"], ACCEPTED)
         old_off = fixtures.find_card(early, "CHECKSUM", occurrence=1)
+        old_end = fixtures.find_card(early, "END", occurrence=1)
 
         completed = materialize_checksums(early)
         # CHECKSUM card slot does not move; only its value is recomputed.
@@ -154,9 +202,10 @@ class MaterializeSuccessTests(unittest.TestCase):
         self.assertEqual(old_off, new_off)
         self.assertNotEqual(completed[old_off + 11:old_off + 27],
                             early[old_off + 11:old_off + 27])
-        # DATASUM fills the slot after END.
-        end_off = fixtures.find_card(completed, "END", occurrence=1)
-        self.assertEqual(completed[end_off + 80:end_off + 88], b"DATASUM ")
+        # DATASUM takes the END card's old slot; END moves one slot
+        # deeper into the padding.
+        self.assertEqual(completed[old_end:old_end + 8], b"DATASUM ")
+        self.assertEqual(completed[old_end + 80:old_end + 160], END_IMAGE)
         self.assertEqual(audit_bytes(completed)["conclusion"], ACCEPTED)
 
 
@@ -296,13 +345,14 @@ class AuditRejectionTests(unittest.TestCase):
         early[480:560] = b"DATASUM  not a value card".ljust(80)
         self._assert_blocked(bytes(early), "NONSPACE_HEADER_PADDING")
 
-    def test_well_formed_padding_checksum_card_is_verified(self):
-        # A correctly shaped DATASUM card placed after END is a real
-        # card and a wrong value rejects via DATASUM_MISMATCH.
+    def test_post_end_checksum_card_is_invisible_to_audit(self):
+        # Even a perfectly well-formed DATASUM card sitting after the END
+        # card is not a card for the stop-at-END audit (nor for any
+        # standard FITS reader): it is non-space padding and rejects.
         cards = [card("SIMPLE", True), card("BITPIX", 8), card("NAXIS", 0)]
         early = bytearray(header_block(cards))
         early[480:560] = card("DATASUM", 12345)
-        self._assert_blocked(bytes(early), "DATASUM_MISMATCH")
+        self._assert_blocked(bytes(early), "NONSPACE_HEADER_PADDING")
 
 
 if __name__ == "__main__":
